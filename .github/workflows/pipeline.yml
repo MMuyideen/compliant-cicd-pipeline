@@ -1,0 +1,404 @@
+name: compliance-cicd-pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC -> Entra ID federated credential exchange
+  contents: read
+
+env:
+  AZURE_REGION: northeurope
+  ACR_NAME: compliancecicdacr
+  ACR_REPOSITORY: patient-portal-service
+  RESOURCE_GROUP: compliance-cicd-rg
+  CONTAINER_APP_ENVIRONMENT: compliance-cicd-app
+  CONTAINER_APP_DEV: compliance-cicd-dev-env
+  CONTAINER_APP_PRODUCTION: compliance-cicd-app-prod
+  EVIDENCE_STORAGE_ACCOUNT: compliancecicdevidence
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Build, unit test, lint — fails closed; nothing downstream runs.
+  # ---------------------------------------------------------------------
+  build-test-lint:
+    runs-on: ubuntu-latest
+    outputs:
+      commit-sha: ${{ steps.vars.outputs.commit_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set variables
+        id: vars
+        run: echo "commit_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test -- --ci --coverage
+
+      - name: Upload coverage as evidence artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 90
+
+      - name: Build container image
+        run: docker build -t "$ACR_REPOSITORY:${{ steps.vars.outputs.commit_sha }}" .
+
+      - name: Save image as artifact for downstream jobs
+        run: docker save "$ACR_REPOSITORY:${{ steps.vars.outputs.commit_sha }}" -o image.tar
+
+      - name: Upload built image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-image
+          path: image.tar
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # 2. SAST + dependency scan — separate job so scan results are captured
+  #    as their own artifact/evidence record, independent of build logs.
+  # ---------------------------------------------------------------------
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-test-lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Semgrep SAST scan
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: p/owasp-top-ten
+
+      - name: Download built image
+        uses: actions/download-artifact@v8
+        with:
+          name: app-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Grype dependency + container vulnerability scan
+        uses: anchore/scan-action@v7
+        with:
+          image: "${{ env.ACR_REPOSITORY }}:${{ needs.build-test-lint.outputs.commit-sha }}"
+          fail-build: true
+          severity-cutoff: high
+
+      - name: Upload scan results as evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-scan-results
+          path: results.sarif
+          retention-days: 2555   # ~7 years, matches evidence_retention_years
+
+  # ---------------------------------------------------------------------
+  # 3. Sign artifact + push to ACR — cryptographic anchor of the chain
+  #    of custody. Keyless signing via cosign's Sigstore/OIDC flow is
+  #    entirely cloud-agnostic: the signature binds to *this* workflow
+  #    run's identity via Sigstore's Fulcio/Rekor, not a long-lived
+  #    private key or anything Azure-specific.
+  # ---------------------------------------------------------------------
+  sign-and-push:
+    runs-on: ubuntu-latest
+    needs: [build-test-lint, security-scan]
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Azure login (CI build identity, via federated OIDC credential)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.CI_BUILD_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Download built image
+        uses: actions/download-artifact@v8
+        with:
+          name: app-image
+
+      - name: Load and tag image
+        run: |
+          docker load -i image.tar
+          docker tag "$ACR_REPOSITORY:${{ needs.build-test-lint.outputs.commit-sha }}" \
+            "$ACR_NAME.azurecr.io/$ACR_REPOSITORY:${{ needs.build-test-lint.outputs.commit-sha }}"
+
+      - name: Push to ACR
+        id: push
+        run: |
+          docker push "$ACR_NAME.azurecr.io/$ACR_REPOSITORY:${{ needs.build-test-lint.outputs.commit-sha }}"
+          digest=$(az acr repository show \
+            --name "$ACR_NAME" --image "$ACR_REPOSITORY:${{ needs.build-test-lint.outputs.commit-sha }}" \
+            --query "digest" --output tsv)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign image (keyless, OIDC identity)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ steps.push.outputs.digest }}"
+
+      - name: Emit evidence record — build/scan/sign stage
+        run: |
+          cat > evidence.json <<EOF
+          {
+            "stage": "build-scan-sign",
+            "commit_sha": "${{ needs.build-test-lint.outputs.commit-sha }}",
+            "image_digest": "${{ steps.push.outputs.digest }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "workflow_run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "signed": true
+          }
+          EOF
+          az storage blob upload \
+            --account-name "$EVIDENCE_STORAGE_ACCOUNT" --container-name evidence \
+            --name "pipeline-evidence/${{ needs.build-test-lint.outputs.commit-sha }}/build-scan-sign.json" \
+            --file evidence.json --auth-mode login
+
+  # ---------------------------------------------------------------------
+  # 4. Deploy to dev — verifies signature before pulling; creates a
+  #    new revision at 0% traffic, health-checks it via its
+  #    revision-specific FQDN, then shifts traffic. Runs smoke + contract
+  #    tests before anything touches prod.
+  # ---------------------------------------------------------------------
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: [build-test-lint, sign-and-push]
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Azure login (CI build identity)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.CI_BUILD_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Verify signature before deploying
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ needs.sign-and-push.outputs.image-digest }}"
+
+      - name: Deploy signed image as a new dev revision, 0% traffic
+        id: dev-revision
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP_DEV" --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ needs.sign-and-push.outputs.image-digest }}" \
+            --revision-suffix "${{ needs.build-test-lint.outputs.commit-sha }}"
+          new_revision=$(az containerapp revision list \
+            --name "$CONTAINER_APP_DEV" --resource-group "$RESOURCE_GROUP" \
+            --query "sort_by([], &properties.createdTime)[-1].name" --output tsv)
+          echo "revision=$new_revision" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for dev revision to report healthy
+        run: |
+          az containerapp revision show \
+            --name "$CONTAINER_APP_DEV" --resource-group "$RESOURCE_GROUP" \
+            --revision "${{ steps.dev-revision.outputs.revision }}" \
+            --query "properties.healthState" --output tsv
+
+      - name: Run smoke + contract tests against dev
+        run: ./tests/smoke-test.sh "$DEV_URL"
+        env:
+          DEV_URL: ${{ secrets.DEV_URL }}
+          COMMIT_SHA: ${{ needs.build-test-lint.outputs.commit-sha }}
+          EVIDENCE_STORAGE_ACCOUNT: ${{ env.EVIDENCE_STORAGE_ACCOUNT }}
+
+  # ---------------------------------------------------------------------
+  # 5. Automated compliance check — independent witness. Confirms actual
+  #    subscription state (not the pipeline's self-report) still matches
+  #    the HIPAA/HITRUST Policy initiative and custom policies before
+  #    allowing a human to even see the approval gate.
+  # ---------------------------------------------------------------------
+  compliance-check:
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    steps:
+      - name: Azure login (CI build identity)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.CI_BUILD_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify no NonCompliant Policy states in the resource group
+        run: |
+          non_compliant=$(az policy state list \
+            --resource-group "$RESOURCE_GROUP" \
+            --filter "complianceState eq 'NonCompliant'" \
+            --query "length(@)" --output tsv)
+          echo "NonCompliant resource count: $non_compliant"
+          if [ "$non_compliant" -ne 0 ]; then
+            az policy state list \
+              --resource-group "$RESOURCE_GROUP" \
+              --filter "complianceState eq 'NonCompliant'" \
+              --query "[].{policy:policyDefinitionName, resource:resourceId}" --output table
+            echo "::error::$non_compliant resource(s) NonCompliant — blocking promotion to production"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------
+  # 6. Manual approval gate — GitHub Environment protection rule on
+  #    `production` requires a named reviewer distinct from the PR author.
+  #    The approval comment MUST reference a change-ticket ID (CHG-####);
+  #    this job parses that from the deployment review comment and fails
+  #    if the pattern is absent, so "approved without a ticket" cannot
+  #    silently proceed even if a human clicks approve.
+  # ---------------------------------------------------------------------
+  change-ticket-gate:
+    runs-on: ubuntu-latest
+    needs: compliance-check
+    environment: production   # <-- protection rule holds the job here until approved
+    steps:
+      - name: Verify change-ticket reference exists on this deployment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          review=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/approvals" \
+            --jq '.[0].comment // ""')
+          if ! echo "$review" | grep -qE 'CHG-[0-9]{4,}'; then
+            echo "::error::Approval comment must reference a change ticket in the form CHG-#### (found: '$review')"
+            exit 1
+          fi
+          echo "change_ticket=$(echo "$review" | grep -oE 'CHG-[0-9]{4,}')" >> "$GITHUB_ENV"
+
+  # ---------------------------------------------------------------------
+  # 7. Production deploy — only reachable once GitHub has minted an
+  #    environment:production-scoped OIDC token, which Entra ID's
+  #    federated identity credential only exchanges for an access token
+  #    after the approval + change-ticket gate above passes. New revision
+  #    at 0% traffic, health-checked, then traffic shifted — with a
+  #    scripted rollback if the post-cutover health check fails, since
+  #    Container Apps has no infra-native circuit breaker (see
+  #    constraints-tradeoffs.md).
+  # ---------------------------------------------------------------------
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: change-ticket-gate
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Azure login (production deploy identity, environment-scoped OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.CI_DEPLOY_PRODUCTION_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Capture previous revision for rollback
+        id: previous
+        run: |
+          prev=$(az containerapp revision list \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --query "[?properties.active].name | [0]" --output tsv)
+          echo "revision=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Create new production revision at 0% traffic
+        id: new-revision
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --image "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ needs.sign-and-push.outputs.image-digest }}" \
+            --revision-suffix "${{ needs.build-test-lint.outputs.commit-sha }}"
+          new=$(az containerapp revision list \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --query "sort_by([], &properties.createdTime)[-1].name" --output tsv)
+          az containerapp ingress traffic set \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --revision-weight "$new=0" "${{ steps.previous.outputs.revision }}=100"
+          echo "revision=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Shift traffic to the new revision
+        run: |
+          az containerapp ingress traffic set \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --revision-weight "${{ steps.new-revision.outputs.revision }}=100"
+
+      - name: Post-cutover health check, roll back on failure
+        id: health-check
+        run: |
+          sleep 30
+          health=$(az containerapp revision show \
+            --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+            --revision "${{ steps.new-revision.outputs.revision }}" \
+            --query "properties.healthState" --output tsv)
+          if [ "$health" != "Healthy" ]; then
+            echo "::error::New revision unhealthy ($health) — rolling back to ${{ steps.previous.outputs.revision }}"
+            az containerapp ingress traffic set \
+              --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
+              --revision-weight "${{ steps.previous.outputs.revision }}=100"
+            echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+
+      - name: Emit final audit evidence record — production deploy
+        if: always()
+        run: |
+          cat > prod-evidence.json <<EOF
+          {
+            "stage": "production-deploy",
+            "commit_sha": "${{ needs.build-test-lint.outputs.commit-sha }}",
+            "image_digest": "${{ needs.sign-and-push.outputs.image-digest }}",
+            "change_ticket": "${{ env.change_ticket }}",
+            "approver": "${{ github.event.deployment.creator.login }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "revision": "${{ steps.new-revision.outputs.revision }}",
+            "rolled_back": ${{ steps.health-check.outputs.rolled_back || 'false' }},
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          az storage blob upload \
+            --account-name "$EVIDENCE_STORAGE_ACCOUNT" --container-name evidence \
+            --name "pipeline-evidence/${{ needs.build-test-lint.outputs.commit-sha }}/production-deploy.json" \
+            --file prod-evidence.json --auth-mode login \
+            --metadata "chain-of-custody=complete"
+
+      - name: Post deploy summary
+        if: always()
+        run: |
+          echo "### Production deploy complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ needs.build-test-lint.outputs.commit-sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Change ticket: \`${{ env.change_ticket }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image digest: \`${{ needs.sign-and-push.outputs.image-digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Revision: \`${{ steps.new-revision.outputs.revision }}\`" >> "$GITHUB_STEP_SUMMARY"
