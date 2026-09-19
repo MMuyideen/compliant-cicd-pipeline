@@ -17,6 +17,7 @@ terraform.rc
 .terraform.lock.hcl
 azurite.tf
 azurite.tfvars
+.claude
 
 # Node
 node_modules/
@@ -51,3 +52,17 @@ image.tar
 demo-data/output/
 
 certs/
+
+# Local notes / drafts
+# architecture.md
+# constraints-tradeoffs.md
+# cost-estimate.md
+# deliverables.md
+# failure-modes-and-mitigation.md
+# interview-points.md
+# linkedin.md
+# monitoring-logging-alerting.md
+# problem-statement.md
+# runbook.md
+# scale-and-budget-scenarios.md
+# script.sh
