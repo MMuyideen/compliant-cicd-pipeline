@@ -71,9 +71,9 @@ variable "container_image_placeholder" {
 }
 
 variable "app_container_port" {
-  description = "Port the application container listens on."
+  description = "Port the application container listens on. Must match src/index.js's PORT default (8080) since the container app has no PORT env var forcing it otherwise."
   type        = number
-  default     = 80
+  default     = 8080
 }
 
 variable "container_cpu" {

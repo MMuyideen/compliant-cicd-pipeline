@@ -344,6 +344,13 @@ resource "azurerm_container_app" "app" {
   }
 
   tags = var.tags
+
+  # The image is CI-managed (az containerapp update, per commit digest) —
+  # Terraform only sets the initial placeholder so the app has something to
+  # boot with the first time this resource is created.
+  lifecycle {
+    ignore_changes = [template[0].container[0].image]
+  }
 }
 
 # ---------------------------------------------------------------------------
