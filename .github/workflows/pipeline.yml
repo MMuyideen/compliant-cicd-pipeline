@@ -202,7 +202,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Azure Login
-        uses: MMuyideen/terraform-modules-and-pipelines/.github/actions/azure-login
+        uses: MMuyideen/terraform-modules-and-pipelines/.github/actions/azure-login@main
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
