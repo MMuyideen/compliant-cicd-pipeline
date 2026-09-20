@@ -16,8 +16,8 @@ env:
   ACR_NAME: compliancecicdacr
   ACR_REPOSITORY: patient-portal-service
   RESOURCE_GROUP: compliance-cicd-rg
-  CONTAINER_APP_ENVIRONMENT: compliance-cicd-app
-  CONTAINER_APP_DEV: compliance-cicd-dev-env
+  CONTAINER_APP_ENVIRONMENT: compliance-cicd-dev-env
+  CONTAINER_APP_DEV: compliance-cicd-app
   CONTAINER_APP_PRODUCTION: compliance-cicd-app-prod
   EVIDENCE_STORAGE_ACCOUNT: compliancecicdevidence
 
