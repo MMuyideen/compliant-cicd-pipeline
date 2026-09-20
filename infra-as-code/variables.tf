@@ -61,7 +61,7 @@ variable "github_org" {
 variable "github_repo" {
   description = "GitHub repository name (org/repo), used in federated identity credential subject conditions. Azure AD federated credentials require an EXACT subject match — unlike AWS IAM's StringLike wildcard support, there is no wildcard here, which is why separate federated credentials exist per trigger type (push to main, pull_request, environment:production) below."
   type        = string
-  default     = "MMuyideen/compliance-ready-cicd-pipeline"
+  default     = "MMuyideen/compliant-cicd-pipeline"
 }
 
 variable "container_image_placeholder" {
