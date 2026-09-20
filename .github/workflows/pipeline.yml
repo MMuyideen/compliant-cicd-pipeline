@@ -210,6 +210,9 @@ jobs:
           # subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Login to ACR
+        run: az acr login --name "$ACR_NAME"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v4.1.2
 
