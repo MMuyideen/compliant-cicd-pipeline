@@ -29,13 +29,16 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       commit-sha: ${{ steps.vars.outputs.commit_sha }}
+      short-sha: ${{ steps.vars.outputs.short_sha }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
 
       - name: Set variables
         id: vars
-        run: echo "commit_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "commit_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -229,7 +232,7 @@ jobs:
           az containerapp update \
             --name "$CONTAINER_APP_DEV" --resource-group "$RESOURCE_GROUP" \
             --image "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ needs.sign-and-push.outputs.image-digest }}" \
-            --revision-suffix "${{ needs.build-test-lint.outputs.commit-sha }}"
+            --revision-suffix "${{ needs.build-test-lint.outputs.short-sha }}"
           new_revision=$(az containerapp revision list \
             --name "$CONTAINER_APP_DEV" --resource-group "$RESOURCE_GROUP" \
             --query "sort_by([], &properties.createdTime)[-1].name" --output tsv)
@@ -348,7 +351,7 @@ jobs:
           az containerapp update \
             --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
             --image "$ACR_NAME.azurecr.io/$ACR_REPOSITORY@${{ needs.sign-and-push.outputs.image-digest }}" \
-            --revision-suffix "${{ needs.build-test-lint.outputs.commit-sha }}"
+            --revision-suffix "${{ needs.build-test-lint.outputs.short-sha }}"
           new=$(az containerapp revision list \
             --name "$CONTAINER_APP_PRODUCTION" --resource-group "$RESOURCE_GROUP" \
             --query "sort_by([], &properties.createdTime)[-1].name" --output tsv)
