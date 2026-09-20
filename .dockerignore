@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log*
+coverage
+.git
+.github
+*.md
+infra-as-code
+tests
+demo-data

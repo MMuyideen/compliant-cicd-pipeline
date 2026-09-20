@@ -1,0 +1,68 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!example.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.terraform.lock.hcl
+azurite.tf
+azurite.tfvars
+.claude
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+coverage/
+*.tgz
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+image.tar
+*.sarif
+
+# Demo data output
+demo-data/output/
+
+certs/
+
+# Local notes / drafts
+# architecture.md
+# constraints-tradeoffs.md
+# cost-estimate.md
+# deliverables.md
+# failure-modes-and-mitigation.md
+# interview-points.md
+# linkedin.md
+# monitoring-logging-alerting.md
+# problem-statement.md
+# runbook.md
+# scale-and-budget-scenarios.md
+script.sh
