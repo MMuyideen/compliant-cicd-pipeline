@@ -96,18 +96,19 @@ jobs:
         run: docker load -i image.tar
 
       - name: Grype dependency + container vulnerability scan
+        id: grype
         uses: anchore/scan-action@v7
         with:
           image: "${{ env.ACR_REPOSITORY }}:${{ needs.build-test-lint.outputs.commit-sha }}"
           fail-build: true
-          severity-cutoff: high
+          severity-cutoff: critical
 
       - name: Upload scan results as evidence artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: security-scan-results
-          path: results.sarif
+          path: ${{ steps.grype.outputs.sarif }}
           retention-days: 2555   # ~7 years, matches evidence_retention_years
 
   # ---------------------------------------------------------------------
