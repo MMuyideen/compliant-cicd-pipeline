@@ -43,16 +43,6 @@ output "key_vault_id" {
   value       = azurerm_key_vault.main.id
 }
 
-output "ci_build_application_client_id" {
-  description = "Client (application) ID GitHub Actions uses to request an Entra ID token for build/test/staging stages, via the federated identity credential."
-  value       = azuread_application.ci_build.client_id
-}
-
-output "ci_deploy_production_application_client_id" {
-  description = "Client (application) ID GitHub Actions uses for the production deploy job. Only usable once the `production` GitHub Environment approval gate has passed (federated credential subject scoped to environment:production)."
-  value       = azuread_application.ci_deploy_production.client_id
-}
-
 output "azure_tenant_id" {
   description = "Entra ID tenant ID, required alongside the client IDs above for azure/login@v2's OIDC-based sign-in in ci-cd/pipeline.yml."
   value       = data.azurerm_client_config.current.tenant_id

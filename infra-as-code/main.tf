@@ -416,7 +416,7 @@ resource "azurerm_application_gateway" "main" {
 
   backend_address_pool {
     name  = "app-backend-pool"
-    fqdns = [azurerm_container_app_environment.main.default_domain]
+    fqdns = [azurerm_container_app.app.ingress[0].fqdn]
   }
 
   backend_http_settings {
@@ -426,6 +426,24 @@ resource "azurerm_application_gateway" "main" {
     protocol                            = "Https"
     request_timeout                     = 30
     pick_host_name_from_backend_address = true
+    probe_name                          = "app-health-probe"
+  }
+
+  # Default probe hits "/", which the app never defines (see src/server.js —
+  # only /healthz and /api/patients exist), so it must be pointed explicitly
+  # at the app's actual health endpoint.
+  probe {
+    name                                      = "app-health-probe"
+    protocol                                  = "Https"
+    path                                      = "/healthz"
+    interval                                  = 30
+    timeout                                   = 30
+    unhealthy_threshold                       = 3
+    pick_host_name_from_backend_http_settings = true
+
+    match {
+      status_code = ["200-399"]
+    }
   }
 
   http_listener {
@@ -456,53 +474,60 @@ resource "azurerm_application_gateway" "main" {
 }
 
 # ---------------------------------------------------------------------------
-# GitHub OIDC federation via Entra ID App Registrations. Two apps, ci_build (no production deploy or
-# evidence-tamper permissions) and ci_deploy_production (only usable once the
-# `production` GitHub Environment approval gate has passed).
+# Private DNS for the internal Container Apps environment. With a
+# customer-supplied VNet, Azure does not auto-provision or link a zone for
+# the environment's default domain, so the App Gateway's backend pool FQDN
+# is otherwise unresolvable (backend health stays "Unknown" indefinitely).
 # ---------------------------------------------------------------------------
-resource "azuread_application" "ci_build" {
-  display_name = "${var.project_name}-ci-build"
+resource "azurerm_private_dns_zone" "container_apps" {
+  name                = azurerm_container_app_environment.main.default_domain
+  resource_group_name = azurerm_resource_group.main.name
+  tags                = var.tags
 }
 
-resource "azuread_service_principal" "ci_build" {
-  client_id = azuread_application.ci_build.client_id
+resource "azurerm_private_dns_zone_virtual_network_link" "container_apps" {
+  name                  = "${var.project_name}-appenv-dns-link"
+  resource_group_name   = azurerm_resource_group.main.name
+  private_dns_zone_name = azurerm_private_dns_zone.container_apps.name
+  virtual_network_id    = azurerm_virtual_network.main.id
+  tags                  = var.tags
 }
 
-resource "azuread_application_federated_identity_credential" "ci_build_push" {
-  application_id = azuread_application.ci_build.id
-  display_name   = "github-push-main"
-  audiences      = ["api://AzureADTokenExchange"]
-  issuer         = "https://token.actions.githubusercontent.com"
-  subject        = "repo:${var.github_repo}:ref:refs/heads/main"
+resource "azurerm_private_dns_a_record" "container_apps_apex" {
+  name                = "@"
+  zone_name           = azurerm_private_dns_zone.container_apps.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_container_app_environment.main.static_ip_address]
 }
 
-resource "azuread_application_federated_identity_credential" "ci_build_pull_request" {
-  application_id = azuread_application.ci_build.id
-  display_name   = "github-pull-request"
-  audiences      = ["api://AzureADTokenExchange"]
-  issuer         = "https://token.actions.githubusercontent.com"
-  subject        = "repo:${var.github_repo}:pull_request"
+resource "azurerm_private_dns_a_record" "container_apps_wildcard" {
+  name                = "*"
+  zone_name           = azurerm_private_dns_zone.container_apps.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_container_app_environment.main.static_ip_address]
 }
 
-resource "azuread_application" "ci_deploy_production" {
-  display_name = "${var.project_name}-ci-deploy-production"
+# Individual container apps in an internal environment get FQDNs of the
+# form "<app>.internal.<default_domain>" — one label deeper than the
+# top-level wildcard above covers.
+resource "azurerm_private_dns_a_record" "container_apps_internal_wildcard" {
+  name                = "*.internal"
+  zone_name           = azurerm_private_dns_zone.container_apps.name
+  resource_group_name = azurerm_resource_group.main.name
+  ttl                 = 300
+  records             = [azurerm_container_app_environment.main.static_ip_address]
 }
 
-resource "azuread_service_principal" "ci_deploy_production" {
-  client_id = azuread_application.ci_deploy_production.client_id
-}
-
-# The `environment:production` subject claim is only present in GitHub OIDC
-# tokens issued for jobs targeting the protected `production` environment —
-# this is what turns "approval happened" into a cryptographic precondition
-# instead of a policy, same property as the AWS design's `sub` claim scoping.
-resource "azuread_application_federated_identity_credential" "ci_deploy_production" {
-  application_id = azuread_application.ci_deploy_production.id
-  display_name   = "github-environment-production"
-  audiences      = ["api://AzureADTokenExchange"]
-  issuer         = "https://token.actions.githubusercontent.com"
-  subject        = "repo:${var.github_repo}:environment:production"
-}
+# ---------------------------------------------------------------------------
+# GitHub OIDC federation (ci_build / ci_deploy_production app registrations,
+# service principals, and federated credentials) is managed manually outside
+# Terraform. Point CI_BUILD_CLIENT_ID / CI_DEPLOY_PRODUCTION_CLIENT_ID GitHub
+# secrets at whatever app registrations are created by hand, and re-add
+# azurerm_role_assignment blocks below scoped to their service principal
+# object IDs.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Least-privilege RBAC for the CI identities. Azure RBAC has no
@@ -532,32 +557,9 @@ resource "azurerm_role_definition" "evidence_writer" {
   assignable_scopes = [azurerm_storage_account.evidence.id]
 }
 
-resource "azurerm_role_assignment" "ci_deploy_evidence_write" {
-  scope              = azurerm_storage_account.evidence.id
-  role_definition_id = azurerm_role_definition.evidence_writer.role_definition_resource_id
-  principal_id       = azuread_service_principal.ci_deploy_production.object_id
-}
-
-resource "azurerm_role_assignment" "ci_build_evidence_write" {
-  scope              = azurerm_storage_account.evidence.id
-  role_definition_id = azurerm_role_definition.evidence_writer.role_definition_resource_id
-  principal_id       = azuread_service_principal.ci_build.object_id
-}
-
-resource "azurerm_role_assignment" "ci_build_acr_push" {
-  scope                = azurerm_container_registry.main.id
-  role_definition_name = "AcrPush"
-  principal_id         = azuread_service_principal.ci_build.object_id
-}
-
-# Scoped to the single Container App resource, not the whole resource group —
-# the CI deploy identity can update revisions/traffic on this app and
-# nothing else.
-resource "azurerm_role_assignment" "ci_deploy_container_app" {
-  scope                = azurerm_container_app.app.id
-  role_definition_name = "Container Apps Contributor"
-  principal_id         = azuread_service_principal.ci_deploy_production.object_id
-}
+# Role assignments for the CI identities (evidence write, ACR push, Container
+# Apps deploy) are managed manually alongside the app registrations above —
+# see azurerm_role_definition.evidence_writer for the custom role to assign.
 
 # ---------------------------------------------------------------------------
 # Resource locks — stand in for part of what an AWS IAM explicit Deny would
